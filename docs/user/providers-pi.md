@@ -84,11 +84,13 @@ threads.
 - If discovery cannot complete, T3 Code keeps Pi available with the `Pi default` model. Start a
   thread to let the interactive Pi session handle any startup prompt.
 - If Pi skips project settings, extensions, skills, prompts, MCP servers, or system prompt files
-  because the folder is not trusted, the thread shows a notice on the first turn of the Pi session.
-  Run the configured Pi binary in that folder on the server machine, using the same provider
-  environment, including `PI_CODING_AGENT_DIR` if set. Trust the folder or its parent with `/trust`,
-  then start a new thread using that same worktree. Launch arguments with `--no-approve` keep
-  project files off without the notice.
+  because the folder is not trusted, the first turn of a Pi thread asks whether to trust the folder.
+  Accepting writes the decision to Pi's trust store for the agent directory T3 Code launches Pi
+  with, and the project resources load the next time Pi starts: open a new thread, or restart T3
+  Code and continue this one. Declining shows the manual path, which also works on its own: run the
+  configured Pi binary in that folder on the server machine, using the same provider environment,
+  including `PI_CODING_AGENT_DIR` if set, and trust the folder or its parent with `/trust`. Launch
+  arguments with `--no-approve` keep project files off without asking.
 - To see context usage on web and desktop, turn on **Context window** in **Settings → Appearance →
   Thread details**. It appears once Pi reports usage for the thread. Some model providers only
   report usage when a response completes, so it can wait for the first reply.

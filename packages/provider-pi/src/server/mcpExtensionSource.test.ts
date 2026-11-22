@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Pi extensions run outside Effect; these tests exercise their native filesystem boundary.
+import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
@@ -31,6 +32,7 @@ type InputHook = (
 async function loadHooks(
   commands: ReadonlyArray<SkillCommand> = [],
   argv: ReadonlyArray<string> = [],
+  env: Record<string, string> = {},
 ) {
   const handlers = new Map<string, unknown>();
   const source = NodeModule.stripTypeScriptTypes(
@@ -40,9 +42,11 @@ async function loadHooks(
     ),
   );
   await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
-    process: { env: {}, argv },
+    process: { env, argv },
     NodeFSP,
+    NodeOS,
     NodePath,
+    NodeCrypto,
     stripFrontmatter: (content: string) => content,
     pi: {
       on: (name: string, handler: unknown) => handlers.set(name, handler),
@@ -98,28 +102,142 @@ describe("Pi orchestration prompt section", () => {
 });
 
 describe("Pi project trust", () => {
-  it.each([
-    { name: "a trusted folder", trusted: true, argv: [], notices: 0 },
-    { name: "an untrusted folder", trusted: false, argv: [], notices: 1 },
-    { name: "--no-approve", trusted: false, argv: ["--approve", "-na"], notices: 0 },
-  ])("sends $notices trust notice per session for $name", async ({ trusted, argv, notices }) => {
-    const sent: string[] = [];
-    const ctx = {
-      cwd: "/repo",
-      isProjectTrusted: () => trusted,
-      ui: { notify: (message: string) => sent.push(message) },
-    };
-    // Pi reruns extension factories on session replacement without asking about trust again.
-    for (const _session of [1, 2]) {
-      const handlers = (await loadHooks([], ["node", "pi", ...argv])) as Map<
-        string,
-        (event: unknown, ctx: unknown) => unknown
-      >;
-      for (const _turn of [1, 2]) await handlers.get("before_agent_start")!({}, ctx);
+  async function withProject(
+    run: (input: { readonly projectDir: string; readonly agentDir: string }) => Promise<void>,
+  ) {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pi-project-trust-"));
+    const projectDir = NodePath.join(root, "project");
+    const agentDir = NodePath.join(root, "agent");
+    await NodeFSP.mkdir(projectDir, { recursive: true });
+    try {
+      await run({ projectDir, agentDir });
+    } finally {
+      await NodeFSP.rm(root, { recursive: true, force: true });
     }
-    assert.equal(sent.length, notices * 2);
-    for (const message of sent)
-      assert.include(message, "for /repo because the folder is not trusted");
+  }
+
+  async function readTrustStore(agentDir: string) {
+    return JSON.parse(
+      await NodeFSP.readFile(NodePath.join(agentDir, "trust.json"), "utf8"),
+    ) as Record<string, unknown>;
+  }
+
+  async function trustStoreOrUndefined(agentDir: string) {
+    try {
+      return await readTrustStore(agentDir);
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Pi reruns extension factories on session replacement without asking about trust again.
+  const sessions = [1, 2];
+  const turnsPerSession = [1, 2];
+
+  it("asks once per session and records trust when accepted", async () => {
+    await withProject(async ({ projectDir, agentDir }) => {
+      const confirmed: string[] = [];
+      const notices: Array<{ message: string; level: string }> = [];
+      const ctx = {
+        cwd: projectDir,
+        isProjectTrusted: () => false,
+        ui: {
+          confirm: async (title: string) => {
+            confirmed.push(title);
+            return true;
+          },
+          notify: (message: string, level: string) => notices.push({ message, level }),
+        },
+      };
+      for (const _session of sessions) {
+        const handlers = (await loadHooks([], ["node", "pi"], {
+          PI_CODING_AGENT_DIR: agentDir,
+        })) as Map<string, (event: unknown, ctx: unknown) => unknown>;
+        for (const _turn of turnsPerSession) await handlers.get("before_agent_start")!({}, ctx);
+      }
+      assert.equal(confirmed.length, sessions.length);
+      assert.equal(confirmed[0], "Trust this project folder for Pi?");
+      const key = await NodeFSP.realpath(projectDir);
+      assert.deepEqual(await readTrustStore(agentDir), { [key]: true });
+      assert.equal(notices.length, sessions.length);
+      for (const notice of notices) {
+        assert.equal(notice.level, "info");
+        assert.include(notice.message, `Pi now trusts ${projectDir}`);
+      }
+    });
+  });
+
+  it("keeps the guidance notice and asks again when declined", async () => {
+    await withProject(async ({ projectDir, agentDir }) => {
+      const confirmed: string[] = [];
+      const notices: string[] = [];
+      const ctx = {
+        cwd: projectDir,
+        isProjectTrusted: () => false,
+        ui: {
+          confirm: async (title: string) => {
+            confirmed.push(title);
+            return false;
+          },
+          notify: (message: string) => notices.push(message),
+        },
+      };
+      for (const _session of sessions) {
+        const handlers = (await loadHooks([], ["node", "pi"], {
+          PI_CODING_AGENT_DIR: agentDir,
+        })) as Map<string, (event: unknown, ctx: unknown) => unknown>;
+        for (const _turn of turnsPerSession) await handlers.get("before_agent_start")!({}, ctx);
+      }
+      assert.equal(confirmed.length, sessions.length);
+      assert.isUndefined(await trustStoreOrUndefined(agentDir));
+      assert.equal(notices.length, sessions.length);
+      for (const message of notices) {
+        assert.include(message, `for ${projectDir} because the folder is not trusted`);
+      }
+    });
+  });
+
+  it.each([
+    { name: "a trusted folder", trusted: true, argv: [] },
+    { name: "--no-approve", trusted: false, argv: ["--approve", "-na"] },
+  ])("stays quiet and does not ask for $name", async ({ trusted, argv }) => {
+    await withProject(async ({ projectDir, agentDir }) => {
+      const ctx = {
+        cwd: projectDir,
+        isProjectTrusted: () => trusted,
+        ui: { confirm: assert.fail, notify: assert.fail },
+      };
+      for (const _session of sessions) {
+        const handlers = (await loadHooks([], ["node", "pi", ...argv], {
+          PI_CODING_AGENT_DIR: agentDir,
+        })) as Map<string, (event: unknown, ctx: unknown) => unknown>;
+        for (const _turn of turnsPerSession) await handlers.get("before_agent_start")!({}, ctx);
+      }
+      assert.isUndefined(await trustStoreOrUndefined(agentDir));
+    });
+  });
+
+  it("leaves an unreadable trust store alone and explains the manual path", async () => {
+    await withProject(async ({ projectDir, agentDir }) => {
+      const trustPath = NodePath.join(agentDir, "trust.json");
+      await NodeFSP.mkdir(agentDir, { recursive: true });
+      await NodeFSP.writeFile(trustPath, "{ not json", "utf8");
+      const notices: string[] = [];
+      const handlers = (await loadHooks([], ["node", "pi"], {
+        PI_CODING_AGENT_DIR: agentDir,
+      })) as Map<string, (event: unknown, ctx: unknown) => unknown>;
+      await handlers.get("before_agent_start")!(
+        {},
+        {
+          cwd: projectDir,
+          isProjectTrusted: () => false,
+          ui: { confirm: async () => true, notify: (message: string) => notices.push(message) },
+        },
+      );
+      assert.equal(await NodeFSP.readFile(trustPath, "utf8"), "{ not json");
+      assert.equal(notices.length, 1);
+      assert.include(notices[0]!, "because the folder is not trusted");
+    });
   });
 });
 
