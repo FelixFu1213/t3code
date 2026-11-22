@@ -17,6 +17,7 @@ export const PI_T3_MCP_EXTENSION_SOURCE = `\
 import { stripFrontmatter, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { Type } from "typebox";
 
@@ -252,15 +253,80 @@ function createMcpClient(endpoint: string, token: string) {
   };
 }
 
+const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+const PROJECT_TRUST_TITLE = "Trust this project folder for Pi?";
+
+// Mirrors Pi's own agent directory resolution so the trust store we write is the one Pi reads.
+function piAgentDir(): string {
+  const configured = env(AGENT_DIR_ENV);
+  const home = NodeOS.homedir();
+  if (configured === undefined) return NodePath.resolve(NodePath.join(home, ".pi", "agent"));
+  if (configured === "~") return NodePath.resolve(home);
+  if (configured.startsWith("~/") || configured.startsWith("~" + NodePath.sep)) {
+    return NodePath.resolve(NodePath.join(home, configured.slice(2)));
+  }
+  return NodePath.resolve(configured);
+}
+
+async function trustStoreKey(cwd: string): Promise<string> {
+  try {
+    return await NodeFSP.realpath(cwd);
+  } catch {
+    return NodePath.resolve(cwd);
+  }
+}
+
+// Pi exposes no API to persist trust, and its file format is a flat path-to-boolean map.
+async function rememberProjectTrust(cwd: string): Promise<boolean> {
+  const trustPath = NodePath.join(piAgentDir(), "trust.json");
+  const key = await trustStoreKey(cwd);
+  let store: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(await NodeFSP.readFile(trustPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    store = parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as { code?: string }).code !== "ENOENT") return false;
+  }
+  store[key] = true;
+  const staged = trustPath + "." + NodeCrypto.randomUUID() + ".tmp";
+  try {
+    await NodeFSP.mkdir(NodePath.dirname(trustPath), { recursive: true });
+    await NodeFSP.writeFile(staged, JSON.stringify(store, null, 2) + "\\n", "utf8");
+    await NodeFSP.rename(staged, trustPath);
+    return true;
+  } catch {
+    await NodeFSP.rm(staged, { force: true }).catch(() => {});
+    return false;
+  }
+}
+
 export default async function t3McpExtension(pi: ExtensionAPI) {
   // RPC has no trust prompt, so Pi skips an untrusted folder's protected resources. Session
   // replacement reruns this factory without project_trust, and T3 drops notices outside a turn,
-  // so check each session's first turn. An explicit --no-approve is deliberate and stays quiet.
+  // so ask on each session's first turn. An explicit --no-approve is deliberate and stays quiet.
   let projectTrustChecked = false;
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", async (_event, ctx) => {
     if (projectTrustChecked) return;
     projectTrustChecked = true;
-    if (ctx.isProjectTrusted() || process.argv.some((arg) => arg === "--no-approve" || arg === "-na")) return;
+    if (
+      ctx.isProjectTrusted() ||
+      process.argv.some((arg) => arg === "--no-approve" || arg === "-na")
+    )
+      return;
+    const trusted = await ctx.ui
+      .confirm(
+        PROJECT_TRUST_TITLE,
+        \`\${ctx.cwd}\\n\\nPi loads this folder's .pi settings, extensions, skills, prompts, MCP servers and system prompt files only when you trust it. Trusting also lets Pi install the project's packages and run its extensions. Trust only folders you trust.\`,
+      )
+      .catch(() => false);
+    if (trusted && (await rememberProjectTrust(ctx.cwd))) {
+      ctx.ui.notify(
+        \`Pi now trusts \${ctx.cwd}. Its project resources load the next time Pi starts: open a new thread, or restart T3 Code and continue this one.\`,
+        "info",
+      );
+      return;
+    }
     ctx.ui.notify(
       \`Pi did not load project settings, extensions, skills, prompts, MCP servers or system prompt files for \${ctx.cwd} because the folder is not trusted. To load them, run the configured Pi binary there with the same PI_CODING_AGENT_DIR (if set), trust the folder or its parent with /trust, then start a new thread in that same worktree. To trust every project, add --approve to Pi's launch arguments in T3 Code settings; to keep them off without this notice, add --no-approve.\`,
       "warning",
